@@ -15,7 +15,10 @@
 *.exe
 *.out
 *.app
+output
+
+# Backup files
+*.bak
 
 # Project files
 monguvse
-

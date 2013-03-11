@@ -5123,6 +5123,45 @@ static int set_sock_timeout(SOCKET sock, int milliseconds) {
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *) &t, sizeof(t));
 }
 
+static int accept_new_connection(const struct socket *listener,
+                                 struct mg_context *ctx,
+                                 struct socket* client)
+{
+  int on = 1;
+  char src_addr[20];
+  socklen_t len = sizeof(client->rsa);
+
+  memset(client, 0, sizeof(*client));
+
+  if ((client->sock = accept(listener->sock, &client->rsa.sa, &len)) == INVALID_SOCKET) {
+    fprintf(stderr, "Failed to accept socket. %s, %d\n", __FUNCTION__, __LINE__);
+    return -1;
+  } else if (!check_acl(ctx, ntohl(* (uint32_t *) &client->rsa.sin.sin_addr))) {
+    sockaddr_to_string(src_addr, sizeof(src_addr), &client->rsa);
+    cry(fc(ctx), "%s: %s is not allowed to connect", __func__, src_addr);
+    closesocket(client->sock);
+    return -1;
+  }
+
+  // Put so socket structure into the queue
+  fprintf(stderr, "Accepted socket %d\n", (int) client->sock);
+
+  client->is_ssl = listener->is_ssl;
+  client->ssl_redir = listener->ssl_redir;
+  getsockname(client->sock, &client->lsa.sa, &len);
+
+  // Set TCP keep-alive. This is needed because if HTTP-level keep-alive
+  // is enabled, and client resets the connection, server won't get
+  // TCP FIN or RST and will keep the connection open forever. With TCP
+  // keep-alive, next keep-alive handshake will figure out that the client
+  // is down and will close the server end.
+  // Thanks to Igor Klopov who suggested the patch.
+  setsockopt(client->sock, SOL_SOCKET, SO_KEEPALIVE, (void *) &on, sizeof(on));
+  set_sock_timeout(client->sock, atoi(ctx->config[REQUEST_TIMEOUT]));
+
+  return 0;
+}
+#if 0
 static void accept_new_connection(const struct socket *listener,
                                   struct mg_context *ctx) {
   struct socket so;
@@ -5151,6 +5190,98 @@ static void accept_new_connection(const struct socket *listener,
     set_sock_timeout(so.sock, atoi(ctx->config[REQUEST_TIMEOUT]));
     produce_socket(ctx, &so);
   }
+}
+#endif /* 0 */
+
+static void schedule_new_connection(struct mg_context *ctx, struct socket* client)
+{
+  struct mg_connection* connection;
+
+  connection = calloc(1, sizeof(*connection) + MAX_REQUEST_SIZE);
+  if (connection == NULL) {
+    cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
+    return;
+  }
+
+  connection->buf_size = MAX_REQUEST_SIZE;
+  connection->buf = (char *) (connection + 1);
+  connection->ctx = ctx;
+  connection->request_info.user_data = ctx->user_data;
+  connection->client = *client;
+
+  connection->birth_time = time(NULL);
+
+  // Fill in IP, port info early so even if SSL setup below fails,
+  // error handler would have the corresponding info.
+  // Thanks to Johannes Winkelmann for the patch.
+  // TODO(lsm): Fix IPv6 case
+  connection->request_info.remote_port = ntohs(connection->client.rsa.sin.sin_port);
+  memcpy(&connection->request_info.remote_ip,
+         &connection->client.rsa.sin.sin_addr.s_addr, 4);
+  connection->request_info.remote_ip = ntohl(connection->request_info.remote_ip);
+  connection->request_info.is_ssl = connection->client.is_ssl;
+
+  if (!connection->client.is_ssl
+#ifndef NO_SSL
+      || sslize(connection, connection->ctx->ssl_ctx, SSL_accept)
+#endif
+     ) {
+    process_new_connection(connection);
+  }
+
+  close_connection(connection);
+  free(connection);
+  // TODO: Finish me
+/*
+  struct mg_context *ctx = thread_func_param;
+  struct mg_connection *conn;
+
+  conn = (struct mg_connection *) calloc(1, sizeof(*conn) + MAX_REQUEST_SIZE);
+  if (conn == NULL) {
+    cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
+  } else {
+    conn->buf_size = MAX_REQUEST_SIZE;
+    conn->buf = (char *) (conn + 1);
+    conn->ctx = ctx;
+    conn->request_info.user_data = ctx->user_data;
+
+    // Call consume_socket() even when ctx->stop_flag > 0, to let it signal
+    // sq_empty condvar to wake up the master waiting in produce_socket()
+    while (consume_socket(ctx, &conn->client)) {
+      conn->birth_time = time(NULL);
+
+      // Fill in IP, port info early so even if SSL setup below fails,
+      // error handler would have the corresponding info.
+      // Thanks to Johannes Winkelmann for the patch.
+      // TODO(lsm): Fix IPv6 case
+      conn->request_info.remote_port = ntohs(conn->client.rsa.sin.sin_port);
+      memcpy(&conn->request_info.remote_ip,
+             &conn->client.rsa.sin.sin_addr.s_addr, 4);
+      conn->request_info.remote_ip = ntohl(conn->request_info.remote_ip);
+      conn->request_info.is_ssl = conn->client.is_ssl;
+
+      if (!conn->client.is_ssl
+#ifndef NO_SSL
+          || sslize(conn, conn->ctx->ssl_ctx, SSL_accept)
+#endif
+         ) {
+        process_new_connection(conn);
+      }
+
+      close_connection(conn);
+    }
+    free(conn);
+  }
+
+  // Signal master that we're done with connection and exiting
+  (void) pthread_mutex_lock(&ctx->mutex);
+  ctx->num_threads--;
+  (void) pthread_cond_signal(&ctx->cond);
+  assert(ctx->num_threads >= 0);
+  (void) pthread_mutex_unlock(&ctx->mutex);
+
+  DEBUG_TRACE(("exiting"));
+*/
 }
 
 static void *master_thread(void *thread_func_param)
@@ -5184,7 +5315,10 @@ static void *master_thread(void *thread_func_param)
         // Therefore, we're checking pfd[i].revents & POLLIN, not
         // pfd[i].revents == POLLIN.
         if (ctx->stop_flag == 0 && (pfd[i].revents & POLLIN)) {
-          accept_new_connection(&ctx->listening_sockets[i], ctx);
+          struct socket client;
+          if (accept_new_connection(&ctx->listening_sockets[i], ctx, &client) == 0) {
+            schedule_new_connection(ctx, &client);
+          }
         }
       }
     }
@@ -5338,10 +5472,12 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
   (void) pthread_cond_init(&ctx->cond, NULL);
   (void) pthread_cond_init(&ctx->sq_empty, NULL);
   (void) pthread_cond_init(&ctx->sq_full, NULL);
+#endif /* 0 */
 
   // Start master (listening) thread
   mg_start_thread(master_thread, ctx);
 
+#if 0
   // Start worker threads
   for (i = 0; i < atoi(ctx->config[NUM_THREADS]); i++) {
     if (mg_start_thread(worker_thread, ctx) != 0) {
