@@ -238,6 +238,7 @@ typedef int SOCKET;
 
 #endif // End of Windows and UNIX specific includes
 
+#include "queue.h"
 #include "monguvse.h"
 
 #ifdef USE_LUA
@@ -468,6 +469,14 @@ static const char *config_options[] = {
   NULL
 };
 
+struct mg_request
+{
+  struct mg_connection* connection;
+  TAILQ_ENTRY(mg_request) link;
+};
+
+TAILQ_HEAD(mg_request_list, mg_request);
+
 struct mg_context {
   volatile int stop_flag;         // Should we stop event loop
   SSL_CTX *ssl_ctx;               // SSL context
@@ -478,6 +487,11 @@ struct mg_context {
   struct socket *listening_sockets;
   int num_listening_sockets;
 
+  pthread_cond_t  cond;           // Condvar for request processor
+
+  struct mg_request_list requests;
+  pthread_mutex_t request_q_mutex;  // Protects request processor
+  pthread_cond_t  request_q_pushed; // Signaled when socket is produced
 #if 0
   volatile int num_threads;  // Number of threads
   pthread_mutex_t mutex;     // Protects (max|num)_threads
@@ -4353,6 +4367,12 @@ static void handle_request(struct mg_connection *conn) {
   conn->throttle = set_throttle(conn->ctx->config[THROTTLE],
                                 get_remote_ip(conn), ri->uri);
 
+  if (conn->ctx->callbacks.before_request != NULL &&
+      conn->ctx->callbacks.before_request(conn)) {
+    send_http_error(conn, 404, "Not Found", "Not Found");
+    return;
+  }
+
   DEBUG_TRACE(("%s", ri->uri));
   // Perform redirect and auth checks before calling begin_request() handler.
   // Otherwise, begin_request() would need to perform auth checks and redirects.
@@ -4947,6 +4967,28 @@ struct mg_connection *mg_download(const char *host, int port, int use_ssl,
   return conn;
 }
 
+static int read_request_header(struct mg_connection *connection, char* ebuf, int size)
+{
+  struct mg_request_info *ri = &connection->request_info;
+
+  // Important: on new connection, reset the receiving buffer. Credit goes
+  // to crule42.
+  connection->data_len = 0;
+
+  if (!getreq(connection, ebuf, size)) {
+    send_http_error(connection, 500, "Server Error", "%s", ebuf);
+  } else if (!is_valid_uri(connection->request_info.uri)) {
+    snprintf(ebuf, size, "Invalid URI: [%s]", ri->uri);
+    send_http_error(connection, 400, "Bad Request", "%s", ebuf);
+  } else if (strcmp(ri->http_version, "1.0") &&
+             strcmp(ri->http_version, "1.1")) {
+    snprintf(ebuf, size, "Bad HTTP version: [%s]", ri->http_version);
+    send_http_error(connection, 505, "Bad HTTP version", "%s", ebuf);
+  }
+
+  return strlen(ebuf);
+}
+
 static void process_new_connection(struct mg_connection *conn) {
   struct mg_request_info *ri = &conn->request_info;
   int keep_alive_enabled, keep_alive, discard_len;
@@ -4998,6 +5040,79 @@ static void process_new_connection(struct mg_connection *conn) {
     assert(conn->data_len >= 0);
     assert(conn->data_len <= conn->buf_size);
   } while (keep_alive);
+}
+
+static void produce_request(struct mg_context *ctx, struct mg_connection *connection)
+{
+/*
+  (void) pthread_mutex_lock(&ctx->mutex);
+
+  // If the queue is full, wait
+  while (ctx->stop_flag == 0 &&
+         ctx->sq_head - ctx->sq_tail >= (int) ARRAY_SIZE(ctx->queue)) {
+    (void) pthread_cond_wait(&ctx->sq_empty, &ctx->mutex);
+  }
+
+  if (ctx->sq_head - ctx->sq_tail < (int) ARRAY_SIZE(ctx->queue)) {
+    // Copy socket to the queue and increment head
+    ctx->queue[ctx->sq_head % ARRAY_SIZE(ctx->queue)] = *sp;
+    ctx->sq_head++;
+    DEBUG_TRACE(("queued socket %d", sp->sock));
+  }
+
+  (void) pthread_cond_signal(&ctx->sq_full);
+  (void) pthread_mutex_unlock(&ctx->mutex);
+*/
+#if 0 /* monguvse */
+  (void) pthread_mutex_lock(&ctx->mutex);
+
+  // If the queue is full, wait
+  while (ctx->stop_flag == 0 &&
+         ctx->sq_head - ctx->sq_tail >= (int) ARRAY_SIZE(ctx->queue)) {
+    (void) pthread_cond_wait(&ctx->sq_empty, &ctx->mutex);
+  }
+
+  if (ctx->sq_head - ctx->sq_tail < (int) ARRAY_SIZE(ctx->queue)) {
+    // Copy socket to the queue and increment head
+    ctx->queue[ctx->sq_head % ARRAY_SIZE(ctx->queue)] = *sp;
+    ctx->sq_head++;
+    DEBUG_TRACE(("queued socket %d", sp->sock));
+  }
+
+  (void) pthread_cond_signal(&ctx->sq_full);
+  (void) pthread_mutex_unlock(&ctx->mutex);
+#endif /* 0 */
+}
+
+static int consume_request(struct mg_context *ctx, struct mg_connection *connection)
+{
+#if 0 /* monguvse */
+  (void) pthread_mutex_lock(&ctx->mutex);
+  DEBUG_TRACE(("going idle"));
+
+  // If the queue is empty, wait. We're idle at this point.
+  while (ctx->sq_head == ctx->sq_tail && ctx->stop_flag == 0) {
+    pthread_cond_wait(&ctx->sq_full, &ctx->mutex);
+  }
+
+  // If we're stopping, sq_head may be equal to sq_tail.
+  if (ctx->sq_head > ctx->sq_tail) {
+    // Copy socket from the queue and increment tail
+    *sp = ctx->queue[ctx->sq_tail % ARRAY_SIZE(ctx->queue)];
+    ctx->sq_tail++;
+    DEBUG_TRACE(("grabbed socket %d, going busy", sp->sock));
+
+    // Wrap pointers if needed
+    while (ctx->sq_tail > (int) ARRAY_SIZE(ctx->queue)) {
+      ctx->sq_tail -= ARRAY_SIZE(ctx->queue);
+      ctx->sq_head -= ARRAY_SIZE(ctx->queue);
+    }
+  }
+
+  (void) pthread_cond_signal(&ctx->sq_empty);
+  (void) pthread_mutex_unlock(&ctx->mutex);
+#endif /* 0 */
+  return !ctx->stop_flag;
 }
 
 // Worker threads take accepted socket from the queue
@@ -5086,6 +5201,13 @@ static void *worker_thread(void *thread_func_param)
   return NULL;
 }
 #endif /* 0 */
+
+static void* request_processor(void* thread_func_param)
+{
+  struct mg_context *ctx = thread_func_param;
+
+  return NULL;
+}
 
 // Master thread adds accepted socket to a queue
 static void produce_socket(struct mg_context *ctx, const struct socket *sp)
@@ -5195,9 +5317,12 @@ static void accept_new_connection(const struct socket *listener,
 
 static void schedule_new_connection(struct mg_context *ctx, struct socket* client)
 {
+  #define EBUF_SIZE 100
+  char* ebuf;
+  struct mg_request_info *ri;
   struct mg_connection* connection;
 
-  connection = calloc(1, sizeof(*connection) + MAX_REQUEST_SIZE);
+  connection = calloc(1, sizeof(*connection) + MAX_REQUEST_SIZE + EBUF_SIZE);
   if (connection == NULL) {
     cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
     return;
@@ -5221,6 +5346,48 @@ static void schedule_new_connection(struct mg_context *ctx, struct socket* clien
   connection->request_info.remote_ip = ntohl(connection->request_info.remote_ip);
   connection->request_info.is_ssl = connection->client.is_ssl;
 
+  if (connection->client.is_ssl) {
+    sslize(connection, connection->ctx->ssl_ctx, SSL_accept);
+  }
+
+  ri = &connection->request_info;
+  ebuf = connection->buf + connection->buf_size;
+
+  if (read_request_header(connection, ebuf, EBUF_SIZE) != 0) {
+    if (ri->remote_user != NULL) {
+      free((void *) ri->remote_user);
+    }
+    return;
+  }
+  // TODO: Finish me
+
+  // 1. Check the request URI
+  // 2. Schedule the request
+
+  handle_request(connection);
+  if (connection->ctx->callbacks.end_request != NULL) {
+    connection->ctx->callbacks.end_request(connection, connection->status_code);
+  }
+  log_access(connection);
+  if (ri->remote_user != NULL) {
+    free((void *) ri->remote_user);
+  }
+
+  close_connection(connection);
+  free(connection);
+/*
+  if (ctx->callbacks->schedule_request == NULL ||
+      ctx->callbacks->schedule_request(connection) == 0)
+  {
+    // TODO: Push to request queue
+    process_new_connection(connection);
+    close_connection(connection);
+    free(connection);
+  } else {
+    // TODO: Handle the request in a new thread
+  }
+*/
+/*
   if (!connection->client.is_ssl
 #ifndef NO_SSL
       || sslize(connection, connection->ctx->ssl_ctx, SSL_accept)
@@ -5231,7 +5398,7 @@ static void schedule_new_connection(struct mg_context *ctx, struct socket* clien
 
   close_connection(connection);
   free(connection);
-  // TODO: Finish me
+*/
 /*
   struct mg_context *ctx = thread_func_param;
   struct mg_connection *conn;
@@ -5476,6 +5643,10 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
 
   // Start master (listening) thread
   mg_start_thread(master_thread, ctx);
+
+  if (mg_start_thread(request_processor, ctx) != 0) {
+    cry(fc(ctx), "Cannot start the request processor: %ld", (long) ERRNO);
+  }
 
 #if 0
   // Start worker threads

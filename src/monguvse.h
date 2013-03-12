@@ -56,6 +56,8 @@ struct mg_request_info {
 // which callbacks to invoke. For detailed description, see
 // https://github.com/valenok/mongoose/blob/master/UserManual.md
 struct mg_callbacks {
+  int  (*schedule_request)(struct mg_connection *); // 0: Request queue, 1: New thread
+  int  (*before_request)(struct mg_connection *);
   int  (*begin_request)(struct mg_connection *);
   void (*end_request)(const struct mg_connection *, int reply_status_code);
   int  (*log_message)(const struct mg_connection *, const char *message);
