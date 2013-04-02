@@ -238,6 +238,7 @@ typedef int SOCKET;
 
 #endif // End of Windows and UNIX specific includes
 
+#include "uv.h"
 #include "queue.h"
 #include "monguvse.h"
 
@@ -469,42 +470,6 @@ static const char *config_options[] = {
   NULL
 };
 
-struct mg_request
-{
-  struct mg_connection* connection;
-  TAILQ_ENTRY(mg_request) link;
-};
-
-TAILQ_HEAD(mg_request_list, mg_request);
-
-struct mg_context {
-  volatile int stop_flag;         // Should we stop event loop
-  SSL_CTX *ssl_ctx;               // SSL context
-  char *config[NUM_OPTIONS];      // Mongoose configuration parameters
-  struct mg_callbacks callbacks;  // User-defined callback function
-  void *user_data;                // User-defined data
-
-  struct socket *listening_sockets;
-  int num_listening_sockets;
-
-  pthread_cond_t  cond;           // Condvar for request processor
-
-  struct mg_request_list requests;
-  pthread_mutex_t request_q_mutex;  // Protects request processor
-  pthread_cond_t  request_q_pushed; // Signaled when socket is produced
-#if 0
-  volatile int num_threads;  // Number of threads
-  pthread_mutex_t mutex;     // Protects (max|num)_threads
-  pthread_cond_t  cond;      // Condvar for tracking workers terminations
-
-  struct socket queue[20];   // Accepted sockets
-  volatile int sq_head;      // Head of the socket queue
-  volatile int sq_tail;      // Tail of the socket queue
-  pthread_cond_t sq_full;    // Signaled when socket is produced
-  pthread_cond_t sq_empty;   // Signaled when socket is consumed
-#endif /* 0 */
-};
-
 struct mg_connection {
   struct mg_request_info request_info;
   struct mg_context *ctx;
@@ -526,6 +491,72 @@ struct mg_connection {
   time_t last_throttle_time;  // Last time throttled data was sent
   int64_t last_throttle_bytes;// Bytes sent this second
 };
+
+struct mg_request
+{
+  struct mg_connection    connection;
+  TAILQ_ENTRY(mg_request) link;
+};
+
+TAILQ_HEAD(mg_request_list, mg_request);
+
+struct mg_context {
+  volatile int stop_flag;         // Should we stop event loop
+  SSL_CTX *ssl_ctx;               // SSL context
+  char *config[NUM_OPTIONS];      // Mongoose configuration parameters
+  struct mg_callbacks callbacks;  // User-defined callback function
+  void *user_data;                // User-defined data
+
+  struct socket *listening_sockets;
+  int num_listening_sockets;
+
+  //pthread_cond_t  cond;           // Condvar for request processor
+
+  int             req_proc_run;
+  uv_loop_t*      req_proc_loop;
+  pthread_cond_t  req_proc_cond;
+  pthread_mutex_t req_proc_mutex;
+  uv_async_t      req_proc_async;
+
+  struct mg_request_list requests;
+  pthread_mutex_t request_q_mutex;  // Protects request processor
+  //pthread_cond_t  request_q_pushed; // Signaled when socket is produced
+#if 0
+  volatile int num_threads;  // Number of threads
+  pthread_mutex_t mutex;     // Protects (max|num)_threads
+  pthread_cond_t  cond;      // Condvar for tracking workers terminations
+
+  struct socket queue[20];   // Accepted sockets
+  volatile int sq_head;      // Head of the socket queue
+  volatile int sq_tail;      // Tail of the socket queue
+  pthread_cond_t sq_full;    // Signaled when socket is produced
+  pthread_cond_t sq_empty;   // Signaled when socket is consumed
+#endif /* 0 */
+};
+
+/*
+struct mg_connection {
+  struct mg_request_info request_info;
+  struct mg_context *ctx;
+  SSL *ssl;                   // SSL descriptor
+  SSL_CTX *client_ssl_ctx;    // SSL context for client connections
+  struct socket client;       // Connected client
+  time_t birth_time;          // Time when request was received
+  int64_t num_bytes_sent;     // Total bytes sent to client
+  int64_t content_len;        // Content-Length header value
+  int64_t consumed_content;   // How many bytes of content have been read
+  char *buf;                  // Buffer for received data
+  char *path_info;            // PATH_INFO part of the URL
+  int must_close;             // 1 if connection must be closed
+  int buf_size;               // Buffer size
+  int request_len;            // Size of the request + headers in a buffer
+  int data_len;               // Total size of data in a buffer
+  int status_code;            // HTTP reply status code, e.g. 200
+  int throttle;               // Throttling, bytes/sec. <= 0 means no throttle
+  time_t last_throttle_time;  // Last time throttled data was sent
+  int64_t last_throttle_bytes;// Bytes sent this second
+};
+*/
 
 const char **mg_get_valid_option_names(void) {
   return config_options;
@@ -5202,12 +5233,14 @@ static void *worker_thread(void *thread_func_param)
 }
 #endif /* 0 */
 
+/*
 static void* request_processor(void* thread_func_param)
 {
   struct mg_context *ctx = thread_func_param;
 
   return NULL;
 }
+*/
 
 // Master thread adds accepted socket to a queue
 static void produce_socket(struct mg_context *ctx, const struct socket *sp)
@@ -5317,24 +5350,40 @@ static void accept_new_connection(const struct socket *listener,
 
 static void schedule_new_connection(struct mg_context *ctx, struct socket* client)
 {
-  #define EBUF_SIZE 100
+  #define EBUF_SIZE 256
   char* ebuf;
-  struct mg_request_info *ri;
-  struct mg_connection* connection;
+  struct mg_request*      req;
+  struct mg_request_info* ri;
+  struct mg_connection*   connection;
 
+  req = calloc(1, sizeof(*connection) + MAX_REQUEST_SIZE + EBUF_SIZE);
+  if (req == NULL) {
+    cry(fc(ctx), "%s", "Cannot create new request struct, OOM");
+    return;
+  }
+/*
   connection = calloc(1, sizeof(*connection) + MAX_REQUEST_SIZE + EBUF_SIZE);
   if (connection == NULL) {
     cry(fc(ctx), "%s", "Cannot create new connection struct, OOM");
     return;
   }
+*/
 
+  connection = &req->connection;
+  connection->buf_size = MAX_REQUEST_SIZE;
+  connection->buf = (char *) (req + 1);
+  connection->ctx = ctx;
+  connection->request_info.user_data = ctx->user_data;
+  connection->client = *client;
+  connection->birth_time = time(NULL);
+/*
   connection->buf_size = MAX_REQUEST_SIZE;
   connection->buf = (char *) (connection + 1);
   connection->ctx = ctx;
   connection->request_info.user_data = ctx->user_data;
   connection->client = *client;
-
   connection->birth_time = time(NULL);
+*/
 
   // Fill in IP, port info early so even if SSL setup below fails,
   // error handler would have the corresponding info.
@@ -5546,6 +5595,10 @@ static void free_context(struct mg_context *ctx) {
   }
 #endif // !NO_SSL
 
+  //
+  // TODO: Free all resources related to the request processor
+  //
+
   // Deallocate context itself
   free(ctx);
 }
@@ -5563,6 +5616,8 @@ void mg_stop(struct mg_context *ctx) {
   (void) WSACleanup();
 #endif // _WIN32
 }
+
+static void* request_processor(void* thread_func_param);
 
 struct mg_context *mg_start(const struct mg_callbacks *callbacks,
                             void *user_data,
@@ -5644,9 +5699,21 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
   // Start master (listening) thread
   mg_start_thread(master_thread, ctx);
 
+  ctx->req_proc_run = 0;
+  ctx->req_proc_loop = uv_loop_new();
+  pthread_cond_init(&ctx->req_proc_cond, NULL);
+  pthread_mutex_init(&ctx->req_proc_mutex, NULL);
+
+  //extern void* request_processor(void* thread_func_param);
   if (mg_start_thread(request_processor, ctx) != 0) {
     cry(fc(ctx), "Cannot start the request processor: %ld", (long) ERRNO);
   }
+
+  pthread_mutex_lock(&ctx->req_proc_mutex);
+  while (ctx->req_proc_run != 1) {
+    pthread_cond_wait(&ctx->req_proc_cond, &ctx->req_proc_mutex);
+  }
+  pthread_mutex_unlock(&ctx->req_proc_mutex);
 
 #if 0
   // Start worker threads
@@ -5660,4 +5727,48 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
 #endif /* 0 */
 
   return ctx;
+}
+
+static void req_proc_run(uv_async_t *handle, int status /*UNUSED*/)
+{
+  fprintf(stderr, "Consuming requests\n");
+}
+
+static void req_proc_pacemaker_destroy(uv_handle_t* handle)
+{
+  //fprintf(stderr, "%s\n", __FUNCTION__);
+  free(handle);
+}
+
+static void req_proc_start(uv_timer_t* handle, int status)
+{
+  struct mg_context* ctx = handle->data;
+
+  fprintf(stderr, "Request processor starts\n");
+
+  pthread_mutex_lock(&ctx->req_proc_mutex);
+  ctx->req_proc_run = 1;
+  pthread_cond_signal(&ctx->req_proc_cond);
+  pthread_mutex_unlock(&ctx->req_proc_mutex);
+
+  uv_close((uv_handle_t*)handle, req_proc_pacemaker_destroy);
+}
+
+static void* request_processor(void* thread_func_param)
+{
+  uv_timer_t* pacemaker;
+  struct mg_context* ctx = thread_func_param;
+
+  uv_async_init(ctx->req_proc_loop, &ctx->req_proc_async, req_proc_run);
+
+  pacemaker = calloc(1, sizeof(*pacemaker));
+  if (pacemaker == NULL) { /* !?*/ return NULL; }
+  uv_timer_init(ctx->req_proc_loop, pacemaker);
+  uv_timer_start(pacemaker, req_proc_start, 0, 0);
+  pacemaker->data = ctx;
+  //uv_unref((uv_handle_t*)pacemaker);
+
+  uv_run(ctx->req_proc_loop);
+
+  return NULL;
 }

@@ -18,8 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#ifndef MONGOOSE_HEADER_INCLUDED
-#define  MONGOOSE_HEADER_INCLUDED
+#ifndef MONGUVSE_HEADER_INCLUDED
+#define MONGUVSE_HEADER_INCLUDED
 
 #include <stdio.h>
 #include <stddef.h>
@@ -298,6 +298,6 @@ void mg_md5(char buf[33], ...);
 
 #ifdef __cplusplus
 }
-#endif // __cplusplus
+#endif /* __cplusplus */
 
-#endif // MONGOOSE_HEADER_INCLUDED
+#endif /* MONGUVSE_HEADER_INCLUDED */
