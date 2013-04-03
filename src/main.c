@@ -297,8 +297,13 @@ static void start_monguvse(int argc, char** argv)
 */
 
   /* Start Mongoose */
+  extern int request_scheduler(struct mg_connection *conn);
+  extern int request_router(struct mg_connection *conn);
   memset(&callbacks, 0, sizeof(callbacks));
   callbacks.log_message = &log_message;
+  callbacks.schedule_request = &request_scheduler;
+  callbacks.begin_request = &request_router;
+
   _ctx = mg_start(&callbacks, NULL, (const char **) options);
   for (i = 0; options[i] != NULL; i++) {
     free(options[i]);

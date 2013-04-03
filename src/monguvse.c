@@ -4398,11 +4398,13 @@ static void handle_request(struct mg_connection *conn) {
   conn->throttle = set_throttle(conn->ctx->config[THROTTLE],
                                 get_remote_ip(conn), ri->uri);
 
+/*
   if (conn->ctx->callbacks.before_request != NULL &&
       conn->ctx->callbacks.before_request(conn)) {
     send_http_error(conn, 404, "Not Found", "Not Found");
     return;
   }
+*/
 
   DEBUG_TRACE(("%s", ri->uri));
   // Perform redirect and auth checks before calling begin_request() handler.
@@ -5348,6 +5350,8 @@ static void accept_new_connection(const struct socket *listener,
 }
 #endif /* 0 */
 
+static void* request_processor(void* thread_func_param);
+
 static void schedule_new_connection(struct mg_context *ctx, struct socket* client)
 {
   #define EBUF_SIZE 256
@@ -5395,9 +5399,11 @@ static void schedule_new_connection(struct mg_context *ctx, struct socket* clien
   connection->request_info.remote_ip = ntohl(connection->request_info.remote_ip);
   connection->request_info.is_ssl = connection->client.is_ssl;
 
+#ifndef NO_SSL
   if (connection->client.is_ssl) {
     sslize(connection, connection->ctx->ssl_ctx, SSL_accept);
   }
+#endif
 
   ri = &connection->request_info;
   ebuf = connection->buf + connection->buf_size;
@@ -5408,11 +5414,19 @@ static void schedule_new_connection(struct mg_context *ctx, struct socket* clien
     }
     return;
   }
-  // TODO: Finish me
 
-  // 1. Check the request URI
-  // 2. Schedule the request
+  if (ctx->callbacks.schedule_request == NULL ||
+      ctx->callbacks.schedule_request(connection) == 0)
+  {
+    pthread_mutex_lock(&ctx->request_q_mutex);
+    TAILQ_INSERT_TAIL(&ctx->requests, req, link);
+    pthread_mutex_unlock(&ctx->request_q_mutex);
+    uv_async_send(&ctx->req_proc_async);
+  } else {
+    mg_start_thread(request_processor, connection);
+  }
 
+/*
   handle_request(connection);
   if (connection->ctx->callbacks.end_request != NULL) {
     connection->ctx->callbacks.end_request(connection, connection->status_code);
@@ -5424,6 +5438,7 @@ static void schedule_new_connection(struct mg_context *ctx, struct socket* clien
 
   close_connection(connection);
   free(connection);
+*/
 /*
   if (ctx->callbacks->schedule_request == NULL ||
       ctx->callbacks->schedule_request(connection) == 0)
@@ -5617,7 +5632,7 @@ void mg_stop(struct mg_context *ctx) {
 #endif // _WIN32
 }
 
-static void* request_processor(void* thread_func_param);
+static void* request_queue(void* thread_func_param);
 
 struct mg_context *mg_start(const struct mg_callbacks *callbacks,
                             void *user_data,
@@ -5696,16 +5711,18 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
   (void) pthread_cond_init(&ctx->sq_full, NULL);
 #endif /* 0 */
 
-  // Start master (listening) thread
-  mg_start_thread(master_thread, ctx);
+  TAILQ_INIT(&ctx->requests);
+  pthread_mutex_init(&ctx->request_q_mutex, NULL);
 
   ctx->req_proc_run = 0;
   ctx->req_proc_loop = uv_loop_new();
   pthread_cond_init(&ctx->req_proc_cond, NULL);
   pthread_mutex_init(&ctx->req_proc_mutex, NULL);
 
-  //extern void* request_processor(void* thread_func_param);
-  if (mg_start_thread(request_processor, ctx) != 0) {
+  // Start master (listening) thread
+  mg_start_thread(master_thread, ctx);
+
+  if (mg_start_thread(request_queue, ctx) != 0) {
     cry(fc(ctx), "Cannot start the request processor: %ld", (long) ERRNO);
   }
 
@@ -5729,9 +5746,43 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
   return ctx;
 }
 
+static void request_do(struct mg_connection *connection)
+{
+  fprintf(stderr, "Handling requests\n");
+
+  handle_request(connection);
+  if (connection->ctx->callbacks.end_request != NULL) {
+    connection->ctx->callbacks.end_request(connection, connection->status_code);
+  }
+  log_access(connection);
+  if (connection->request_info.remote_user != NULL) {
+    free((void *) connection->request_info.remote_user);
+  }
+
+  close_connection(connection);
+  free(connection);
+}
+
 static void req_proc_run(uv_async_t *handle, int status /*UNUSED*/)
 {
+  int empty;
+  struct mg_request* req;
+  struct mg_context* ctx = handle->data;
+
   fprintf(stderr, "Consuming requests\n");
+
+  do {
+    pthread_mutex_lock(&ctx->request_q_mutex);
+    req = TAILQ_FIRST(&ctx->requests);
+    TAILQ_REMOVE(&ctx->requests, req, link);
+    pthread_mutex_unlock(&ctx->request_q_mutex);
+
+    request_do(&req->connection);
+
+    pthread_mutex_lock(&ctx->request_q_mutex);
+    empty = TAILQ_EMPTY(&ctx->requests);
+    pthread_mutex_unlock(&ctx->request_q_mutex);
+  } while (!empty);
 }
 
 static void req_proc_pacemaker_destroy(uv_handle_t* handle)
@@ -5754,21 +5805,33 @@ static void req_proc_start(uv_timer_t* handle, int status)
   uv_close((uv_handle_t*)handle, req_proc_pacemaker_destroy);
 }
 
-static void* request_processor(void* thread_func_param)
+static void* request_queue(void* thread_func_param)
 {
   uv_timer_t* pacemaker;
   struct mg_context* ctx = thread_func_param;
 
   uv_async_init(ctx->req_proc_loop, &ctx->req_proc_async, req_proc_run);
+  ctx->req_proc_async.data = ctx;
 
   pacemaker = calloc(1, sizeof(*pacemaker));
-  if (pacemaker == NULL) { /* !?*/ return NULL; }
+  if (pacemaker == NULL) { /* !? */ return NULL; }
   uv_timer_init(ctx->req_proc_loop, pacemaker);
   uv_timer_start(pacemaker, req_proc_start, 0, 0);
   pacemaker->data = ctx;
   //uv_unref((uv_handle_t*)pacemaker);
 
   uv_run(ctx->req_proc_loop);
+
+  return NULL;
+}
+
+static void* request_processor(void* thread_func_param)
+{
+  fprintf(stderr, "%s\n", __FUNCTION__);
+
+  struct mg_connection *connection = thread_func_param;
+
+  request_do(connection);
 
   return NULL;
 }
