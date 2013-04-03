@@ -127,8 +127,17 @@ static void die(const char *fmt, ...)
 
 static int log_message(const struct mg_connection *conn, const char *message)
 {
-  (void) conn;
+  //(void) conn;
   fprintf(stderr, "%s\n", message);
+
+  return 0;
+}
+
+static int log_message2(const struct mg_context *ctx, const char *format, va_list ap)
+{
+  //(void) conn;
+  vfprintf(stderr, format, ap);
+  fprintf(stderr, "\n");
 
   return 0;
 }
@@ -301,6 +310,7 @@ static void start_monguvse(int argc, char** argv)
   extern int request_router(struct mg_connection *conn);
   memset(&callbacks, 0, sizeof(callbacks));
   callbacks.log_message = &log_message;
+  callbacks.log_message2 = &log_message2;
   callbacks.schedule_request = &request_scheduler;
   callbacks.begin_request = &request_router;
 

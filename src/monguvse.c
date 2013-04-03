@@ -680,6 +680,17 @@ static void cry(struct mg_connection *conn, const char *fmt, ...) {
   }
 }
 
+static void log_message(const struct mg_context *ctx, const char *format, ...)
+{
+  if (ctx->callbacks.log_message != NULL) {
+    va_list ap;
+
+    va_start(ap, format);
+    ctx->callbacks.log_message2(ctx, format, ap);
+    va_end(ap);
+  }
+}
+
 // Return fake connection structure. Used for logging, if connection
 // is not applicable at the moment of logging.
 static struct mg_connection *fc(struct mg_context *ctx) {
@@ -5022,6 +5033,7 @@ static int read_request_header(struct mg_connection *connection, char* ebuf, int
   return strlen(ebuf);
 }
 
+#if 0 /* monguvse */
 static void process_new_connection(struct mg_connection *conn) {
   struct mg_request_info *ri = &conn->request_info;
   int keep_alive_enabled, keep_alive, discard_len;
@@ -5077,7 +5089,6 @@ static void process_new_connection(struct mg_connection *conn) {
 
 static void produce_request(struct mg_context *ctx, struct mg_connection *connection)
 {
-/*
   (void) pthread_mutex_lock(&ctx->mutex);
 
   // If the queue is full, wait
@@ -5095,31 +5106,10 @@ static void produce_request(struct mg_context *ctx, struct mg_connection *connec
 
   (void) pthread_cond_signal(&ctx->sq_full);
   (void) pthread_mutex_unlock(&ctx->mutex);
-*/
-#if 0 /* monguvse */
-  (void) pthread_mutex_lock(&ctx->mutex);
-
-  // If the queue is full, wait
-  while (ctx->stop_flag == 0 &&
-         ctx->sq_head - ctx->sq_tail >= (int) ARRAY_SIZE(ctx->queue)) {
-    (void) pthread_cond_wait(&ctx->sq_empty, &ctx->mutex);
-  }
-
-  if (ctx->sq_head - ctx->sq_tail < (int) ARRAY_SIZE(ctx->queue)) {
-    // Copy socket to the queue and increment head
-    ctx->queue[ctx->sq_head % ARRAY_SIZE(ctx->queue)] = *sp;
-    ctx->sq_head++;
-    DEBUG_TRACE(("queued socket %d", sp->sock));
-  }
-
-  (void) pthread_cond_signal(&ctx->sq_full);
-  (void) pthread_mutex_unlock(&ctx->mutex);
-#endif /* 0 */
 }
 
 static int consume_request(struct mg_context *ctx, struct mg_connection *connection)
 {
-#if 0 /* monguvse */
   (void) pthread_mutex_lock(&ctx->mutex);
   DEBUG_TRACE(("going idle"));
 
@@ -5144,14 +5134,13 @@ static int consume_request(struct mg_context *ctx, struct mg_connection *connect
 
   (void) pthread_cond_signal(&ctx->sq_empty);
   (void) pthread_mutex_unlock(&ctx->mutex);
-#endif /* 0 */
+
   return !ctx->stop_flag;
 }
 
 // Worker threads take accepted socket from the queue
 static int consume_socket(struct mg_context *ctx, struct socket *sp)
 {
-#if 0 /* monguvse */
   (void) pthread_mutex_lock(&ctx->mutex);
   DEBUG_TRACE(("going idle"));
 
@@ -5176,11 +5165,10 @@ static int consume_socket(struct mg_context *ctx, struct socket *sp)
 
   (void) pthread_cond_signal(&ctx->sq_empty);
   (void) pthread_mutex_unlock(&ctx->mutex);
-#endif /* 0 */
+
   return !ctx->stop_flag;
 }
 
-#if 0 /* monguvse */
 static void *worker_thread(void *thread_func_param)
 {
   struct mg_context *ctx = thread_func_param;
@@ -5233,21 +5221,10 @@ static void *worker_thread(void *thread_func_param)
   DEBUG_TRACE(("exiting"));
   return NULL;
 }
-#endif /* 0 */
-
-/*
-static void* request_processor(void* thread_func_param)
-{
-  struct mg_context *ctx = thread_func_param;
-
-  return NULL;
-}
-*/
 
 // Master thread adds accepted socket to a queue
 static void produce_socket(struct mg_context *ctx, const struct socket *sp)
 {
-#if 0 /* monguvse */
   (void) pthread_mutex_lock(&ctx->mutex);
 
   // If the queue is full, wait
@@ -5265,8 +5242,8 @@ static void produce_socket(struct mg_context *ctx, const struct socket *sp)
 
   (void) pthread_cond_signal(&ctx->sq_full);
   (void) pthread_mutex_unlock(&ctx->mutex);
-#endif /* 0 */
 }
+#endif /* 0 */
 
 static int set_sock_timeout(SOCKET sock, int milliseconds) {
 #ifdef _WIN32
@@ -5291,7 +5268,7 @@ static int accept_new_connection(const struct socket *listener,
   memset(client, 0, sizeof(*client));
 
   if ((client->sock = accept(listener->sock, &client->rsa.sa, &len)) == INVALID_SOCKET) {
-    fprintf(stderr, "Failed to accept socket. %s, %d\n", __FUNCTION__, __LINE__);
+    log_message(ctx, "Failed to accept socket. %s, %d", __FUNCTION__, __LINE__);
     return -1;
   } else if (!check_acl(ctx, ntohl(* (uint32_t *) &client->rsa.sin.sin_addr))) {
     sockaddr_to_string(src_addr, sizeof(src_addr), &client->rsa);
@@ -5301,7 +5278,7 @@ static int accept_new_connection(const struct socket *listener,
   }
 
   // Put so socket structure into the queue
-  fprintf(stderr, "Accepted socket %d\n", (int) client->sock);
+  log_message(ctx, "Accepted socket %d", (int) client->sock);
 
   client->is_ssl = listener->is_ssl;
   client->ssl_redir = listener->ssl_redir;
@@ -5748,7 +5725,7 @@ struct mg_context *mg_start(const struct mg_callbacks *callbacks,
 
 static void request_do(struct mg_connection *connection)
 {
-  fprintf(stderr, "Handling requests\n");
+  log_message(connection->ctx, "%s", __FUNCTION__);
 
   handle_request(connection);
   if (connection->ctx->callbacks.end_request != NULL) {
@@ -5769,7 +5746,7 @@ static void req_proc_run(uv_async_t *handle, int status /*UNUSED*/)
   struct mg_request* req;
   struct mg_context* ctx = handle->data;
 
-  fprintf(stderr, "Consuming requests\n");
+  log_message(ctx, "%s", __FUNCTION__);
 
   do {
     pthread_mutex_lock(&ctx->request_q_mutex);
@@ -5787,7 +5764,10 @@ static void req_proc_run(uv_async_t *handle, int status /*UNUSED*/)
 
 static void req_proc_pacemaker_destroy(uv_handle_t* handle)
 {
-  //fprintf(stderr, "%s\n", __FUNCTION__);
+  struct mg_context* ctx = handle->data;
+
+  log_message(ctx, "%s", __FUNCTION__);
+
   free(handle);
 }
 
@@ -5795,7 +5775,7 @@ static void req_proc_start(uv_timer_t* handle, int status)
 {
   struct mg_context* ctx = handle->data;
 
-  fprintf(stderr, "Request processor starts\n");
+  log_message(ctx, "%s", __FUNCTION__);
 
   pthread_mutex_lock(&ctx->req_proc_mutex);
   ctx->req_proc_run = 1;
@@ -5827,9 +5807,9 @@ static void* request_queue(void* thread_func_param)
 
 static void* request_processor(void* thread_func_param)
 {
-  fprintf(stderr, "%s\n", __FUNCTION__);
-
   struct mg_connection *connection = thread_func_param;
+
+  log_message(connection->ctx, "%s", __FUNCTION__);
 
   request_do(connection);
 

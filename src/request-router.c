@@ -34,8 +34,8 @@ int request_scheduler(struct mg_connection *conn)
 {
 	const struct mg_request_info *request_info = mg_get_request_info(conn);
 
-	fprintf(stderr, "%s\n", __FUNCTION__);
-	fprintf(stderr, "URI: %s\n", request_info->uri);
+	//fprintf(stderr, "%s\n", __FUNCTION__);
+	//fprintf(stderr, "URI: %s\n", request_info->uri);
 
 	if (strcmp(request_info->uri, "/hello") != 0) {
 		return 1; /* To be processed in a new thread */

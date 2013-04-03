@@ -23,6 +23,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +71,7 @@ struct mg_callbacks {
   void (*init_lua)(struct mg_connection *, void *lua_context);
   void (*upload)(struct mg_connection *, const char *file_name);
   int  (*http_error)(struct mg_connection *, int status);
+  int  (*log_message2)(const struct mg_context *, const char *format, va_list ap);
 };
 
 // Start web server.
