@@ -24,7 +24,6 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 // Copyright (c) 2004-2013 Sergey Lyubka
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
